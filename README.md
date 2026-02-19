@@ -1,4 +1,4 @@
- # Rev LangGraph + Braintrust Demo
+ # LangGraph + Braintrust Demo
 
  This repo contains a minimal LangGraph agent wired to Braintrust for tracing,
  prompt management, and feedback logging. It also includes a simple React UI
