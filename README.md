@@ -44,49 +44,89 @@ session_store.update_transcript(conversation_id, output_messages)
 ```
 
 ## Per-agent multi-turn highlights
-Each runtime sits behind `src/backend/agent/runner.py:14-62`, but the multi-turn behavior is implemented inside each agent.
+All three frameworks are dispatched through `src/backend/agent/runner.py`, and they all share the same root-span-persistence pattern from `main.py` described above. The differences are in how each framework handles **conversation memory** and how its internal spans get bridged into Braintrust.
 
-### LangGraph (state graph handles the turns)
-- Entry point: `run_langgraph_agent` calls `run_graph` with `conversation_id`, `thread_id`, and any attached document.
-- `run_graph` builds a `StateGraph` (`src/backend/agent/graph.py:117-155`) that keeps `MessagesState` for the current conversation and reuses the same `RunnableConfig` so LangGraph callbacks stay attached to the `thread_id` spanning multiple tools.
-- Tools (`rag_search`, `web_search`) are bound once per model, and document prompts are injected via `document_path` to keep turn continuity.
+### LangGraph (state graph + callback threading)
+
+**How it works:** LangGraph has its own persistence mechanism via `thread_id` in the config, and LangChain's callback system propagates Braintrust spans automatically through `RunnableConfig`.
+
+**Agent-side** (`src/backend/agent/graph.py:117-155`): Each turn invokes the compiled `StateGraph` with the same `thread_id`. The `BraintrustCallbackHandler` is passed via `config["callbacks"]`, so every LLM call and tool invocation inside the graph emits child spans automatically:
 
 ```python
-# src/backend/agent/graph.py lines 117-155
-messages: List[AnyMessage] = [HumanMessage(content=user_message)]
-if document_path:
-    messages.insert(0, SystemMessage(...))
-initial_state = {"messages": messages, ...}
-config = {"configurable": {"thread_id": thread_id}, ...}
+# src/backend/agent/graph.py
+config = {
+    "configurable": {"thread_id": thread_id},
+    "callbacks": callbacks,  # BraintrustCallbackHandler
+    "metadata": metadata,
+}
 return graph.invoke(initial_state, config=cast(Any, config))
 ```
 
-### OpenAI Agents SDK (processor + Braintrust tracing)
-- The agent registers `BraintrustTracingProcessor` so every run emits nested spans while remaining under the `chat_turn` span created in `main.py`.
-- Tools (`rag_search`, `web_search`) share the document path and the common prompt built via `build_summarizer_prompt`.
-- Instructions and metadata are identical turn-to-turn, and the run happens with the same `conversation_id`/`thread_id` from the FastAPI handler.
+**Trace-side** (`src/backend/main.py`): The same `root_span_export` pattern applies — `main.py` creates a root span on the first turn, persists it, and parents every `chat_turn` span to it. The LangChain callback handler then nests LLM/tool spans inside that `chat_turn`.
+
+### OpenAI Agents SDK (tracing processor)
+
+**How it works:** The OpenAI Agents SDK has its own tracing system. Braintrust provides a `BraintrustTracingProcessor` that bridges agent-internal spans into the Braintrust trace tree.
+
+**Agent-side** (`src/backend/agent/openai_agents_agent.py:23-34`): A `BraintrustTracingProcessor` is registered once at startup via `add_trace_processor`. After that, every `Runner.run_sync` call automatically emits nested spans (LLM calls, tool use) into whatever Braintrust span is active:
 
 ```python
-# src/backend/agent/openai_agents_agent.py lines 65-105
-_agent = Agent(..., instructions=_instructions(), tools=[rag_search, web_search], model=selected_model)
+# src/backend/agent/openai_agents_agent.py
+from braintrust.wrappers.openai import BraintrustTracingProcessor
+add_trace_processor(BraintrustTracingProcessor())
+
+# Each turn is stateless — just pass the new message
 result = Runner.run_sync(agent, user_message)
-return AgentTurnResult(assistant_message=str(message), raw_state={"result": str(result)})
 ```
+
+**Trace-side** (`src/backend/main.py`): Same pattern as the other frameworks — `main.py` creates and persists a root span, then parents each `chat_turn` to it. The tracing processor nests the agent's internal spans inside that `chat_turn`.
+
+**Note:** Unlike LangGraph and ADK, the OpenAI Agents SDK doesn't manage conversation memory for you. The multi-turn transcript is maintained entirely by `main.py` and `SessionStore` — the agent itself sees only the current user message per turn.
 
 ### Google ADK (session-backed multi-turn)
-- `run_google_adk_agent` caches a per-model runner and session service.
-- Sessions are keyed on `(conversation_id, thread_id)` so each turn uses the same ADK session; the call to `Runner.run_async` uses `genai_types.Content` with the new user message.
-- The handler streams events, extracts the latest assistant text, and returns it while the shared session ties back to the trace root.
+
+**The problem:** When you use `adk run <agent_name>`, each invocation creates a separate Braintrust trace. For chat-style ADK agents that manage their own memory via `SessionService`, there's no built-in way to keep all turns under one trace.
+
+**The solution:** Don't rely on `adk run` for tracing. Wrap ADK calls in your own service layer and manage the Braintrust root span yourself. Two things are happening in parallel — ADK session management (conversation memory) and Braintrust span management (trace continuity) — and they are independent of each other.
+
+**ADK session continuity** (`src/backend/agent/google_adk_agent.py:85-129`): An `InMemorySessionService` is created once and shared across turns. Sessions are keyed on `(conversation_id, thread_id)` so each turn reuses the same ADK session and conversation memory:
 
 ```python
-# src/backend/agent/google_adk_agent.py lines 37-120
+# src/backend/agent/google_adk_agent.py
+user_id = conversation_id
+session_id = thread_id
+key = (user_id, session_id)
 if key not in _ADK_SESSIONS_CREATED:
-    _ADK_SESSION_SERVICE.create_session(...)
-maybe_events = runner.run_async(..., new_message=Content(...))
-async for event in maybe_events:
-    text = _extract_text_from_event(event)
-return AgentTurnResult(assistant_message=message, raw_state=None)
+    _ADK_SESSION_SERVICE.create_session(
+        app_name=_APP_NAME, user_id=user_id, session_id=session_id,
+    )
+    _ADK_SESSIONS_CREATED.add(key)
+
+# Every subsequent turn just calls run_async with the same session
+async for event in runner.run_async(
+    user_id=user_id, session_id=session_id, new_message=...
+):
+    ...
 ```
+
+**Braintrust trace continuity** (`src/backend/main.py:121-184`): This is the same pattern used by all three frameworks — on the first turn, create a root span and persist `span.export()`. On every turn, pass `parent=root_span_export` when starting a child span. After each turn, update the root span with the running transcript:
+
+```python
+# src/backend/main.py — first turn: create + persist root span
+with logger.start_span(name="Rev Agent") as root_span:
+    root_span_id = root_span.root_span_id
+root_span_export = root_span.export()
+session_store.update_root_span(conversation_id, root_span_id, root_span_export)
+
+# Every turn: parent child spans to the root
+with logger.start_span(name="chat_turn", parent=root_span_export) as span:
+    turn = run_agent_turn(...)  # calls the ADK runner
+
+# After each turn: update root span with full transcript
+update_span(root_span_export, input={"messages": all_input}, output={"messages": all_output})
+```
+
+**Key takeaway:** `span.export()` serializes the span context into a string you can store anywhere (DB, Redis, etc.) and pass back as `parent=` on future turns. This is the mechanism that stitches separate ADK calls into a single trace — ADK's `SessionService` handles conversation memory, Braintrust's `span.export()`/`parent=` handles trace continuity.
 
 ## Supporting pieces
 - `src/backend/agent/prompts.py:17-90` loads the `legal-deposition-assistant` Braintrust prompt for every runtime and logs metadata on the current span.
