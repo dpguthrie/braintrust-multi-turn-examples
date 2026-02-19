@@ -1,31 +1,97 @@
-# Rev Multi-Agent SDK + Braintrust Demo
+# Multi-Agent SDK + Braintrust Demo
 
-This repo contains one shared chat app with three interchangeable agent runtimes:
-- LangGraph
-- OpenAI Agents SDK
-- Google ADK
+This repo runs a single FastAPI + React chat app that keeps one Braintrust trace per `conversation_id` while letting you plug in three different agent runtimes. The multi-turn trace story lives in the backend, so the README now points directly at the code that wires the root span, per-turn spans, and the per-agent persistence logic.
 
-All three use the same:
-- FastAPI chat API and React UI
-- RAG + web-search tools
-- Braintrust prompt loading
-- Braintrust tracing model: one root trace per conversation, child span per turn
+## How one trace survives multiple turns
+1. `src/backend/main.py:108-200` maintains a `SessionStore` row per `conversation_id`, storing the serialized root span export, `thread_id`, document attachment, and transcript. The handler then passes that export into `_handle_chat_turn`, which wraps `run_agent_turn` and logs both metadata and I/O so each `chat_turn` span is attached to the shared root.
 
-## What it demonstrates
-- SDK-swappable multi-turn chat architecture
-- Consistent trace continuity across frameworks
-- Feedback logging (thumbs up/down) per assistant turn
+```python
+# src/backend/main.py lines 108-200
+session = session_store.get_or_create_session(request.conversation_id)
+root_span_export = session.root_span_export or None
+root_span_id = session.root_span_id or None
+created_root = False
+thread_id = session.thread_id or str(uuid.uuid4())
+if not root_span_export or not root_span_id:
+    with logger.start_span(name="Rev Agent") as root_span:
+        root_span.log(...)
+        root_span_id = root_span.root_span_id
+    root_span_export = root_span.export()
+session_store.update_root_span(...)
+...
+turn, span_id, span_export = _handle_chat_turn(..., root_parent=root_span_export, ...)
+```
 
-## Repo layout
-- `src/backend/` FastAPI app
-- `src/backend/agent/` framework adapters and shared tools/prompts
-- `src/backend/agent/graph.py` LangGraph implementation
-- `src/backend/agent/openai_agents_agent.py` OpenAI Agents SDK implementation
-- `src/backend/agent/google_adk_agent.py` Google ADK implementation
-- `src/backend/storage/` session store (SQLite)
-- `src/frontend/` React UI (Vite)
-- `data/` sample deposition text
-- `docs/` workflow and explainer docs
+2. `_handle_chat_turn` creates a `chat_turn` span (see `main.py:60-105`), inserts the same metadata/ids, and flushes updates back into the stored root span after each agent turn so Braintrust retains the full transcript:
+
+```python
+# src/backend/main.py lines 60-105
+with logger.start_span(name="chat_turn", parent=root_parent) as span:
+    turn = run_agent_turn(...)
+    span.log(metadata={...})
+    span.log(input={...}, output={...})
+span_export = span.export()
+return turn, span.span_id, span_export
+```
+
+3. `SessionStore` (`src/backend/storage/session_store.py:19-114`) keeps the shared `thread_id`, root span, transcript array, and uploaded document path per conversation so every request can rehydrate the same trace context.
+
+```python
+# src/backend/storage/session_store.py lines 55-114
+conn.execute("SELECT ... FROM sessions WHERE conversation_id = ?", (conversation_id,))
+...
+session_store.update_transcript(conversation_id, output_messages)
+```
+
+## Per-agent multi-turn highlights
+Each runtime sits behind `src/backend/agent/runner.py:14-62`, but the multi-turn behavior is implemented inside each agent.
+
+### LangGraph (state graph handles the turns)
+- Entry point: `run_langgraph_agent` calls `run_graph` with `conversation_id`, `thread_id`, and any attached document.
+- `run_graph` builds a `StateGraph` (`src/backend/agent/graph.py:117-155`) that keeps `MessagesState` for the current conversation and reuses the same `RunnableConfig` so LangGraph callbacks stay attached to the `thread_id` spanning multiple tools.
+- Tools (`rag_search`, `web_search`) are bound once per model, and document prompts are injected via `document_path` to keep turn continuity.
+
+```python
+# src/backend/agent/graph.py lines 117-155
+messages: List[AnyMessage] = [HumanMessage(content=user_message)]
+if document_path:
+    messages.insert(0, SystemMessage(...))
+initial_state = {"messages": messages, ...}
+config = {"configurable": {"thread_id": thread_id}, ...}
+return graph.invoke(initial_state, config=cast(Any, config))
+```
+
+### OpenAI Agents SDK (processor + Braintrust tracing)
+- The agent registers `BraintrustTracingProcessor` so every run emits nested spans while remaining under the `chat_turn` span created in `main.py`.
+- Tools (`rag_search`, `web_search`) share the document path and the common prompt built via `build_summarizer_prompt`.
+- Instructions and metadata are identical turn-to-turn, and the run happens with the same `conversation_id`/`thread_id` from the FastAPI handler.
+
+```python
+# src/backend/agent/openai_agents_agent.py lines 65-105
+_agent = Agent(..., instructions=_instructions(), tools=[rag_search, web_search], model=selected_model)
+result = Runner.run_sync(agent, user_message)
+return AgentTurnResult(assistant_message=str(message), raw_state={"result": str(result)})
+```
+
+### Google ADK (session-backed multi-turn)
+- `run_google_adk_agent` caches a per-model runner and session service.
+- Sessions are keyed on `(conversation_id, thread_id)` so each turn uses the same ADK session; the call to `Runner.run_async` uses `genai_types.Content` with the new user message.
+- The handler streams events, extracts the latest assistant text, and returns it while the shared session ties back to the trace root.
+
+```python
+# src/backend/agent/google_adk_agent.py lines 37-120
+if key not in _ADK_SESSIONS_CREATED:
+    _ADK_SESSION_SERVICE.create_session(...)
+maybe_events = runner.run_async(..., new_message=Content(...))
+async for event in maybe_events:
+    text = _extract_text_from_event(event)
+return AgentTurnResult(assistant_message=message, raw_state=None)
+```
+
+## Supporting pieces
+- `src/backend/agent/prompts.py:17-90` loads the `legal-deposition-assistant` Braintrust prompt for every runtime and logs metadata on the current span.
+- `src/backend/agent/tools.py:10-42` wraps RAG and Tavily web search tools with Braintrust tracing so all runtimes share the same tool set.
+- Feedback spans attach directly to `msg.span_id` via `/feedback` (`src/backend/main.py:200-232`), ensuring ratings map back to the same `chat_turn` span.
 
 ## Prerequisites
 - Python 3.11+ (use `uv`)
@@ -69,8 +135,7 @@ All three use the same:
 1. Create a Braintrust project (name it `rev-langgraph-demo` or set `BRAINTRUST_PROJECT`).
 2. Create the prompt with slug:
    - `legal-deposition-assistant`
-3. Add environment versions if desired and set `BRAINTRUST_PROMPT_ENV` to
-   `dev`, `staging`, or `production`.
+3. Add environment versions if desired and set `BRAINTRUST_PROMPT_ENV` to `dev`, `staging`, or `production`.
 4. Put your API key in `.env` as `BRAINTRUST_API_KEY=...`.
 
 ## API usage
@@ -85,105 +150,17 @@ All three use the same:
 `POST /feedback`
 - Body: `{ "span_id": "span_123", "rating": "up" }`
 
-## Trace continuity note
-- For multi-turn chats, this app stores a per-conversation root span export in SQLite.
-- Each turn span is created with that root as the parent.
-- Both root span and turn spans include `agent_framework` metadata to support filtering in Braintrust UI.
-- In the Google ADK adapter, ADK sessions are keyed by `conversation_id` + `thread_id` so ADK memory/session continuity aligns with the same trace root.
-- This is the key pattern for keeping one trace per session across all frameworks.
-- If you use `adk run <agent_name>` directly from CLI for each turn, separate traces are expected unless you add your own persisted parent-trace context.
-
-## OpenAI Agents multi-turn
-- Set `AGENT_FRAMEWORK=openai_agents`.
-- Keep the same `conversation_id` across turns when calling `POST /chat`.
-- The backend persists one root span per conversation and creates one `chat_turn` child span per request.
-- OpenAI Agents internal events are captured by the Braintrust OpenAI trace processor (`BraintrustTracingProcessor`) in the adapter, so traces are not limited to a flat top-level span.
-- Use `agent_framework=openai_agents` in Braintrust metadata filters to isolate these sessions.
-
-Example:
-```bash
-curl -s localhost:8000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversation_id":"demo-openai-1","message":"Summarize key facts in one sentence."}'
-
-curl -s localhost:8000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversation_id":"demo-openai-1","message":"Now give me two follow-up questions."}'
-```
-
-Expected behavior:
-- Same `root_span_id` in both responses.
-- Different `span_id` per turn.
-- Nested OpenAI Agents spans visible under the turn/root trace tree in Braintrust.
-
-## LangGraph multi-turn
-- Set `AGENT_FRAMEWORK=langgraph`.
-- Keep the same `conversation_id` across turns when calling `POST /chat`.
-- LangGraph internals are traced through the Braintrust LangChain callback handler, so model/tool nodes appear as nested spans.
-- Use `agent_framework=langgraph` in Braintrust metadata filters.
-
-Example:
-```bash
-curl -s localhost:8000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversation_id":"demo-langgraph-1","message":"Summarize key facts in one sentence."}'
-
-curl -s localhost:8000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversation_id":"demo-langgraph-1","message":"Now give me two follow-up questions."}'
-```
-
-Expected behavior:
-- Same `root_span_id` in both responses.
-- Different `span_id` per turn.
-- Nested LangGraph spans (for example model/tool call nodes) under each `chat_turn`.
-
-## Google ADK multi-turn
-- Set `AGENT_FRAMEWORK=google_adk`.
-- Provide Gemini/Google credentials:
-  - `GOOGLE_API_KEY=...` (preferred), or
-  - `GEMINI_API_KEY=...`, or
-  - Vertex AI auth (`vertexai`, `project`, `location`).
-- Keep the same `conversation_id` across turns when calling `POST /chat`.
-- The adapter maps ADK session identity to `conversation_id` + `thread_id`, so ADK memory/session continuity follows the same Braintrust root trace.
-- Use `agent_framework=google_adk` in Braintrust metadata filters.
-
-Example:
-```bash
-curl -s localhost:8000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversation_id":"demo-adk-1","message":"Summarize key facts in one sentence."}'
-
-curl -s localhost:8000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"conversation_id":"demo-adk-1","message":"Now give me two follow-up questions."}'
-```
-
-Expected behavior:
-- Same `root_span_id` in both responses.
-- Different `span_id` per turn.
-- ADK execution spans nested under the same session trace.
-
-Common ADK issue:
-- `RESOURCE_EXHAUSTED (429)` indicates API quota/billing limits on the configured Gemini project/key, not a tracing/session wiring bug.
-
 ## Notes
 - RAG tests are skipped unless `OPENAI_API_KEY` is set.
 - Feedback test is skipped unless `BRAINTRUST_API_KEY` is set.
 - Prompts are loaded from Braintrust if available. Local fallbacks are used when prompts are missing or unavailable.
 
 ## References
-- Braintrust LangGraph integration:
-  https://www.braintrust.dev/docs/integrations/sdk-integrations/langgraph
-- Braintrust LangChain integration:
-  https://www.braintrust.dev/docs/integrations/langchain
-- Braintrust OpenAI Agents integration:
-  https://www.braintrust.dev/docs/integrations/sdk-integrations/openai-agents
-- Braintrust Google ADK integration:
-  https://www.braintrust.dev/docs/integrations/sdk-integrations/google-adk
-- Braintrust feedback/labels:
-  https://www.braintrust.dev/docs/annotate/labels
+- Braintrust LangGraph integration: https://www.braintrust.dev/docs/integrations/sdk-integrations/langgraph
+- Braintrust LangChain integration: https://www.braintrust.dev/docs/integrations/langchain
+- Braintrust OpenAI Agents integration: https://www.braintrust.dev/docs/integrations/sdk-integrations/openai-agents
+- Braintrust Google ADK integration: https://www.braintrust.dev/docs/integrations/sdk-integrations/google-adk
+- Braintrust feedback/labels: https://www.braintrust.dev/docs/annotate/labels
 
 ## Attribution
-Portions of the frontend UI are adapted from Vercel's `ai-chatbot` repository
-under the Apache 2.0 license: https://github.com/vercel/ai-chatbot
+Portions of the frontend UI are adapted from Vercel's `ai-chatbot` repository under the Apache 2.0 license: https://github.com/vercel/ai-chatbot
