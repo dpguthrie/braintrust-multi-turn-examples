@@ -9,7 +9,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from braintrust import update_span
-from src.backend.agent.graph import run_graph
+from src.backend.agent.runner import resolve_agent_framework, run_agent_turn
 from src.backend.agent.tracing import build_callback_handler, init_tracing
 from src.backend.api.models import (
     ChatRequest,
@@ -49,6 +49,14 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/frameworks")
+def frameworks() -> dict:
+    return {
+        "active": resolve_agent_framework(),
+        "supported": ["langgraph", "openai_agents", "google_adk"],
+    }
+
+
 def _handle_chat_turn(
     conversation_id: str,
     thread_id: str,
@@ -56,10 +64,12 @@ def _handle_chat_turn(
     document_path: str | None,
     logger,
     root_parent: str | None,
+    framework: str,
 ):
     handler = build_callback_handler(logger)
     with logger.start_span(name="chat_turn", parent=root_parent) as span:
-        state = run_graph(
+        turn = run_agent_turn(
+            framework=framework,
             conversation_id=conversation_id,
             thread_id=thread_id,
             user_message=message,
@@ -70,12 +80,14 @@ def _handle_chat_turn(
                 "conversation_id": conversation_id,
                 "thread_id": thread_id,
                 "document_path": document_path,
+                "agent_framework": framework,
             },
         )
         span.log(
             metadata={
                 "conversation_id": conversation_id,
                 "thread_id": thread_id,
+                "agent_framework": framework,
             }
         )
         span.log(
@@ -86,11 +98,11 @@ def _handle_chat_turn(
                 "document_path": document_path,
             },
             output={
-                "assistant_message": state["messages"][-1].content,
+                "assistant_message": turn.assistant_message,
             },
         )
     span_export = span.export()
-    return state, span.span_id, span_export
+    return turn, span.span_id, span_export
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -101,6 +113,7 @@ def chat(request: ChatRequest) -> ChatResponse:
     root_span_export = session.root_span_export or None
     root_span_id = session.root_span_id or None
     created_root = False
+    framework = resolve_agent_framework()
     thread_id = session.thread_id or str(uuid.uuid4())
     if session.thread_id is None:
         session_store.update_thread_id(request.conversation_id, thread_id)
@@ -111,6 +124,7 @@ def chat(request: ChatRequest) -> ChatResponse:
                 metadata={
                     "conversation_id": request.conversation_id,
                     "thread_id": thread_id,
+                    "agent_framework": framework,
                 }
             )
             root_span_id = root_span.root_span_id
@@ -129,13 +143,14 @@ def chat(request: ChatRequest) -> ChatResponse:
             (root_span_export or "")[:12],
         )
 
-    state, span_id, span_export = _handle_chat_turn(
+    turn, span_id, span_export = _handle_chat_turn(
         conversation_id=request.conversation_id,
         thread_id=thread_id,
         message=request.message,
         document_path=session.document_path,
         logger=logger,
         root_parent=root_span_export,
+        framework=framework,
     )
 
     logging.getLogger(__name__).info(
@@ -145,7 +160,7 @@ def chat(request: ChatRequest) -> ChatResponse:
         len(root_span_export or ""),
     )
 
-    assistant_message = state["messages"][-1].content
+    assistant_message = turn.assistant_message
     transcript = session.transcript or []
     input_messages = transcript + [{"role": "user", "content": request.message}]
     output_messages = input_messages + [
@@ -164,6 +179,7 @@ def chat(request: ChatRequest) -> ChatResponse:
                 metadata={
                     "conversation_id": request.conversation_id,
                     "thread_id": thread_id,
+                    "agent_framework": framework,
                 },
             )
             logger.flush()
@@ -232,3 +248,7 @@ def feedback(request: FeedbackRequest) -> FeedbackResponse:
         tags=tags,
     )
     return FeedbackResponse(status="ok")
+
+
+
+    
